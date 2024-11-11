@@ -7,20 +7,21 @@ import numpy as np
 
 from tqdm import tqdm
 from torchvision.utils import save_image, make_grid
-from tqdm import tqdm
 from torch.optim import Adam
 
 import math
+import os
+
+# Create folder for saving plots if it doesn't exist
+os.makedirs("ddpm_plots", exist_ok=True)
 
 # Model Hyperparameters
-
 dataset_path = '~/datasets'
-
-cuda = False
+cuda = True
 DEVICE = torch.device("cuda:0" if cuda else "cpu")
 
 dataset = 'MNIST'
-img_size = (32, 32, 3)   if dataset == "CIFAR10" else (28, 28, 1) # (width, height, channels)
+img_size = (32, 32, 3) if dataset == "CIFAR10" else (28, 28, 1) # (width, height, channels)
 
 timestep_embedding_dim = 256
 n_layers = 8
@@ -31,7 +32,7 @@ beta_minmax=[1e-4, 2e-2]
 train_batch_size = 128
 inference_batch_size = 64
 lr = 5e-5
-epochs = 200
+epochs = 5
 
 seed = 1234
 
@@ -59,7 +60,6 @@ else:
 
 train_loader = DataLoader(dataset=train_dataset, batch_size=train_batch_size, shuffle=True, **kwargs)
 test_loader  = DataLoader(dataset=test_dataset,  batch_size=inference_batch_size, shuffle=False,  **kwargs)
-
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -136,20 +136,20 @@ class Denoiser(nn.Module):
         self.out_project = ConvBlock(hidden_dims[-1], out_channels=img_C, kernel_size=3)
     
     
-def forward(self, perturbed_x, diffusion_timestep):
-    y = perturbed_x
-    
-    diffusion_embedding = self.time_embedding(diffusion_timestep)
-    diffusion_embedding = self.time_project(diffusion_embedding.unsqueeze(-1).unsqueeze(-2))
-    
-    y = self.in_project(y)
-    
-    for i in range(len(self.convs)):
-        y = self.convs[i](y, diffusion_embedding, residual = True)
-        
-    y = self.out_project(y)
-        
-    return y
+    def forward(self, perturbed_x, diffusion_timestep):
+        y = perturbed_x
+
+        diffusion_embedding = self.time_embedding(diffusion_timestep)
+        diffusion_embedding = self.time_project(diffusion_embedding.unsqueeze(-1).unsqueeze(-2))
+
+        y = self.in_project(y)
+
+        for i in range(len(self.convs)):
+            y = self.convs[i](y, diffusion_embedding, residual = True)
+            
+        y = self.out_project(y)
+            
+        return y
     
 model = Denoiser(image_resolution=img_size,
                  hidden_dims=hidden_dims, 
@@ -182,51 +182,38 @@ class Diffusion(nn.Module):
         self.device = device
     
     def extract(self, a, t, x_shape):
-        """
-            from lucidrains' implementation
-                https://github.com/lucidrains/denoising-diffusion-pytorch/blob/beb2f2d8dd9b4f2bd5be4719f37082fe061ee450/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py#L376
-        """
         b, *_ = t.shape
         out = a.gather(-1, t)
         return out.reshape(b, *((1,) * (len(x_shape) - 1)))
     
     def scale_to_minus_one_to_one(self, x):
-        # according to the DDPMs paper, normalization seems to be crucial to train reverse process network
         return x * 2 - 1
     
     def reverse_scale_to_zero_to_one(self, x):
         return (x + 1) * 0.5
     
     def make_noisy(self, x_zeros, t): 
-        # perturb x_0 into x_t (i.e., take x_0 samples into forward diffusion kernels)
         epsilon = torch.randn_like(x_zeros).to(self.device)
         
         sqrt_alpha_bar = self.extract(self.sqrt_alpha_bars, t, x_zeros.shape)
         sqrt_one_minus_alpha_bar = self.extract(self.sqrt_one_minus_alpha_bars, t, x_zeros.shape)
         
-        # Let's make noisy sample!: i.e., Forward process with fixed variance schedule
-        #      i.e., sqrt(alpha_bar_t) * x_zero + sqrt(1-alpha_bar_t) * epsilon
         noisy_sample = x_zeros * sqrt_alpha_bar + epsilon * sqrt_one_minus_alpha_bar
     
         return noisy_sample.detach(), epsilon
-    
     
     def forward(self, x_zeros):
         x_zeros = self.scale_to_minus_one_to_one(x_zeros)
         
         B, _, _, _ = x_zeros.shape
         
-        # (1) randomly choose diffusion time-step
         t = torch.randint(low=0, high=self.n_times, size=(B,)).long().to(self.device)
         
-        # (2) forward diffusion process: perturb x_zeros with fixed variance schedule
         perturbed_images, epsilon = self.make_noisy(x_zeros, t)
         
-        # (3) predict epsilon(noise) given perturbed data at diffusion-timestep t.
         pred_epsilon = self.model(perturbed_images, t)
         
         return perturbed_images, epsilon, pred_epsilon
-    
     
     def denoise_at_t(self, x_t, timestep, t):
         B, _, _, _ = x_t.shape
@@ -235,7 +222,6 @@ class Diffusion(nn.Module):
         else:
             z = torch.zeros_like(x_t).to(self.device)
         
-        # at inference, we use predicted noise(epsilon) to restore perturbed data sample.
         epsilon_pred = self.model(x_t, timestep)
         
         alpha = self.extract(self.alphas, timestep, x_t.shape)
@@ -243,53 +229,28 @@ class Diffusion(nn.Module):
         sqrt_one_minus_alpha_bar = self.extract(self.sqrt_one_minus_alpha_bars, timestep, x_t.shape)
         sqrt_beta = self.extract(self.sqrt_betas, timestep, x_t.shape)
         
-        # denoise at time t, utilizing predicted noise
         x_t_minus_1 = 1 / sqrt_alpha * (x_t - (1-alpha)/sqrt_one_minus_alpha_bar*epsilon_pred) + sqrt_beta*z
         
         return x_t_minus_1.clamp(-1., 1)
                 
     def sample(self, N):
-        # start from random noise vector, x_0 (for simplicity, x_T declared as x_t instead of x_T)
         x_t = torch.randn((N, self.img_C, self.img_H, self.img_W)).to(self.device)
         
-        # autoregressively denoise from x_T to x_0
-        #     i.e., generate image from noise, x_T
         for t in range(self.n_times-1, -1, -1):
             timestep = torch.tensor([t]).repeat_interleave(N, dim=0).long().to(self.device)
             x_t = self.denoise_at_t(x_t, timestep, t)
         
-        # denormalize x_0 into 0 ~ 1 ranged values.
         x_0 = self.reverse_scale_to_zero_to_one(x_t)
         
         return x_0
     
-    
+
 diffusion = Diffusion(model, image_resolution=img_size, n_times=n_timesteps, 
                       beta_minmax=beta_minmax, device=DEVICE).to(DEVICE)
 
 optimizer = Adam(diffusion.parameters(), lr=lr)
 denoising_loss = nn.MSELoss()
 
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-print("Number of model parameters: ", count_parameters(diffusion))
-
-
-model.eval()
-for batch_idx, (x, _) in enumerate(test_loader):
-    x = x.to(DEVICE)
-    perturbed_images, epsilon, pred_epsilon = diffusion(x)
-    perturbed_images = diffusion.reverse_scale_to_zero_to_one(perturbed_images)
-    break
-
-def show_image(x, idx):
-    fig = plt.figure()
-    plt.imshow(x[idx].transpose(0, 1).transpose(1, 2).detach().cpu().numpy())
-
-
-print("Start training DDPMs...")
 model.train()
 
 for epoch in range(epochs):
@@ -310,3 +271,36 @@ for epoch in range(epochs):
     print("\tEpoch", epoch + 1, "complete!", "\tDenoising Loss: ", noise_prediction_loss / batch_idx)
     
 print("Finish!!")
+
+model.eval()
+
+with torch.no_grad():
+    generated_images = diffusion.sample(N=inference_batch_size)
+
+def show_image(x, idx, postfix):
+    fig = plt.figure()
+    plt.imshow(x[idx].transpose(0, 1).transpose(1, 2).detach().cpu().numpy())
+    plot_path = os.path.join("ddpm_plots", f"{postfix}_{idx}.png")
+    fig.savefig(plot_path)
+    plt.close(fig)
+
+show_image(generated_images, idx=0, postfix="generated_image")
+show_image(generated_images, idx=1, postfix="generated_image")
+show_image(generated_images, idx=2, postfix="generated_image")
+
+
+def draw_sample_image(x, postfix):
+    fig = plt.figure(figsize=(8, 8))
+    plt.axis("off")
+    plt.title("Visualization of {}".format(postfix))
+    plt.imshow(np.transpose(make_grid(x.detach().cpu(), padding=2, normalize=True), (1, 2, 0)))
+    plot_path = os.path.join("ddpm_plots", f"{postfix}.png")
+    fig.savefig(plot_path)
+    plt.close(fig)
+
+
+# Save plots
+perturbed_images, _, _ = diffusion(x)
+draw_sample_image(perturbed_images, "Perturbed Images")
+draw_sample_image(generated_images, "Generated Images")
+draw_sample_image(x[:inference_batch_size], "Ground-truth Images")
