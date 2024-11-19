@@ -11,9 +11,10 @@ from torch.optim import Adam
 
 import math
 import os
-
+from torch_fidelity import calculate_metrics
 # Create folder for saving plots if it doesn't exist
-os.makedirs("ddpm_plots", exist_ok=True)
+os.makedirs("generated_images", exist_ok=True)
+
 
 # Model Hyperparameters
 dataset_path = '~/datasets'
@@ -49,7 +50,7 @@ transform = transforms.Compose([
         transforms.ToTensor(),
 ])
 
-kwargs = {'num_workers': 1, 'pin_memory': True} 
+kwargs = {'num_workers': 4, 'pin_memory': True} 
 
 if dataset == 'CIFAR10':
     train_dataset = CIFAR10(dataset_path, transform=transform, train=True, download=True)
@@ -251,42 +252,58 @@ diffusion = Diffusion(model, image_resolution=img_size, n_times=n_timesteps,
 optimizer = Adam(diffusion.parameters(), lr=lr)
 denoising_loss = nn.MSELoss()
 
+
 model.train()
 
 for epoch in range(epochs):
     noise_prediction_loss = 0
     for batch_idx, (x, _) in tqdm(enumerate(train_loader), total=len(train_loader)):
         optimizer.zero_grad()
-
         x = x.to(DEVICE)
-        
         noisy_input, epsilon, pred_epsilon = diffusion(x)
         loss = denoising_loss(pred_epsilon, epsilon)
-        
         noise_prediction_loss += loss.item()
-        
         loss.backward()
         optimizer.step()
-        
-    print("\tEpoch", epoch + 1, "complete!", "\tDenoising Loss: ", noise_prediction_loss / batch_idx)
     
-print("Finish!!")
+    print(f"Epoch {epoch + 1} complete! Denoising Loss: {noise_prediction_loss / (batch_idx + 1)}")
+
+    # Save generated images every 20 epochs
+    if (epoch + 1) % 20 == 0:
+        model.eval()
+        with torch.no_grad():
+            generated_images = diffusion.sample(N=inference_batch_size)
+        model.train()
+        
+        # Save each generated image
+        for idx in range(generated_images.size(0)):
+            save_image(
+                generated_images[idx],
+                os.path.join("generated_images", f"epoch_{epoch + 1}_image_{idx + 1}.png")
+            )
+        print(f"Generated images saved for epoch {epoch + 1}")
+
 
 model.eval()
 
 with torch.no_grad():
     generated_images = diffusion.sample(N=inference_batch_size)
 
+
+
+
 def show_image(x, idx, postfix):
     fig = plt.figure()
-    plt.imshow(x[idx].transpose(0, 1).transpose(1, 2).detach().cpu().numpy())
+    plt.imshow(x[idx].permute(1, 2, 0).detach().cpu().numpy(), cmap='gray')
+    plt.axis('off')
     plot_path = os.path.join("ddpm_plots", f"{postfix}_{idx}.png")
-    fig.savefig(plot_path)
+    fig.savefig(plot_path, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
 
-show_image(generated_images, idx=0, postfix="generated_image")
-show_image(generated_images, idx=1, postfix="generated_image")
-show_image(generated_images, idx=2, postfix="generated_image")
+for idx in range(generated_images.size(0)):
+    show_image(generated_images, idx=idx, postfix="generated_image")
+
+
 
 
 def draw_sample_image(x, postfix):
@@ -301,6 +318,11 @@ def draw_sample_image(x, postfix):
 
 # Save plots
 perturbed_images, _, _ = diffusion(x)
-draw_sample_image(perturbed_images, "Perturbed Images")
-draw_sample_image(generated_images, "Generated Images")
-draw_sample_image(x[:inference_batch_size], "Ground-truth Images")
+# draw_sample_image(perturbed_images, "Perturbed Images")
+# draw_sample_image(generated_images, "Generated Images")
+# draw_sample_image(x[:inference_batch_size], "Ground-truth Images")
+
+
+
+
+
