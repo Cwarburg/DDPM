@@ -13,7 +13,7 @@ import math
 import os
 from torch_fidelity import calculate_metrics
 # Create folder for saving plots if it doesn't exist
-os.makedirs("generated_images", exist_ok=True)
+os.makedirs("ddpm_plots", exist_ok=True)
 
 
 # Model Hyperparameters
@@ -33,7 +33,7 @@ beta_minmax=[1e-4, 2e-2]
 train_batch_size = 128
 inference_batch_size = 64
 lr = 5e-5
-epochs = 5
+epochs = 500
 
 seed = 1234
 
@@ -237,11 +237,14 @@ class Diffusion(nn.Module):
     def sample(self, N):
         x_t = torch.randn((N, self.img_C, self.img_H, self.img_W)).to(self.device)
         
-        for t in range(self.n_times-1, -1, -1):
+        for t in range(self.n_times - 1, -1, -1):
             timestep = torch.tensor([t]).repeat_interleave(N, dim=0).long().to(self.device)
             x_t = self.denoise_at_t(x_t, timestep, t)
         
         x_0 = self.reverse_scale_to_zero_to_one(x_t)
+        
+        if self.img_C == 1:  # For grayscale images
+            x_0 = x_0[:, :1, :, :]  # Keep only one channel
         
         return x_0
     
@@ -266,8 +269,9 @@ for epoch in range(epochs):
         loss.backward()
         optimizer.step()
     
-    print(f"Epoch {epoch + 1} complete! Denoising Loss: {noise_prediction_loss / (batch_idx + 1)}")
-
+    avg_loss = noise_prediction_loss / (batch_idx + 1)
+    print(f"Epoch {epoch + 1} complete! Denoising Loss: {avg_loss}")
+    
     # Save generated images every 20 epochs
     if (epoch + 1) % 20 == 0:
         model.eval()
@@ -275,13 +279,18 @@ for epoch in range(epochs):
             generated_images = diffusion.sample(N=inference_batch_size)
         model.train()
         
-        # Save each generated image
+        # Create a subfolder for this epoch
+        epoch_subfolder = os.path.join("ddpm_plots", f"images_epoch_{epoch + 1}")
+        os.makedirs(epoch_subfolder, exist_ok=True)
+        
+        # Save each generated image in the subfolder
         for idx in range(generated_images.size(0)):
             save_image(
                 generated_images[idx],
-                os.path.join("generated_images", f"epoch_{epoch + 1}_image_{idx + 1}.png")
+                os.path.join(epoch_subfolder, f"image_{idx + 1}.png")
             )
-        print(f"Generated images saved for epoch {epoch + 1}")
+        print(f"Generated images saved for epoch {epoch + 1} in '{epoch_subfolder}'")
+
 
 
 model.eval()
@@ -294,15 +303,14 @@ with torch.no_grad():
 
 def show_image(x, idx, postfix):
     fig = plt.figure()
-    plt.imshow(x[idx].permute(1, 2, 0).detach().cpu().numpy(), cmap='gray')
+    if x[idx].shape[0] == 1:  # Check for grayscale images
+        plt.imshow(x[idx][0].detach().cpu().numpy(), cmap='gray')  # Single channel
+    else:
+        plt.imshow(x[idx].permute(1, 2, 0).detach().cpu().numpy())  # Multi-channel
     plt.axis('off')
     plot_path = os.path.join("ddpm_plots", f"{postfix}_{idx}.png")
     fig.savefig(plot_path, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
-
-for idx in range(generated_images.size(0)):
-    show_image(generated_images, idx=idx, postfix="generated_image")
-
 
 
 
